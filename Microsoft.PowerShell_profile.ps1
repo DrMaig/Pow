@@ -752,6 +752,7 @@ function Get-ProfileModulePlan {
         @{ Name = 'PSReadLine'; MinVersion = '2.2.6'; Required = $true }
         @{ Name = 'Terminal-Icons'; Required = $false }
         @{ Name = 'PSFzf'; Required = $Global:ProfileConfig.EnableFzf }
+        @{ Name = 'oh-my-posh'; Required = $Global:ProfileConfig.OhMyPosh.Enabled }
     )
     return Get-ModulePlan -DesiredModules $modules
 }
@@ -768,14 +769,206 @@ function Show-ModulePlan {
 
 #endregion
 
+#region 6a - First-Run Provisioning and PATH setup
+# Installs required tooling on the first run (idempotent) and wires PATH/theme locations.
+
+# Shared provision state file (align with Deferred Loader)
+if (-not $script:ProvisionStateFile) {
+    $script:ProvisionStateFile = Join-Path $Global:ProfileConfig.CachePath 'provision_state.json'
+}
+
+function Ensure-PathPrefix {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $separator = [System.IO.Path]::PathSeparator
+        $segments = $env:PATH -split [regex]::Escape($separator)
+        if ($segments -contains $Path) { return $false }
+        $env:PATH = "$Path$separator$env:PATH"
+        return $true
+    } catch {
+        Write-ProfileLog "Ensure-PathPrefix failed for $Path : $_" -Level DEBUG
+        return $false
+    }
+}
+
+function Get-PreferredPackageProvider {
+    try {
+        if (Get-Command Install-PSResource -ErrorAction SilentlyContinue) { return 'PSResourceGet' }
+        if (Get-Command Install-Module -ErrorAction SilentlyContinue) { return 'PowerShellGet' }
+        return $null
+    } catch {
+        Write-ProfileLog "Get-PreferredPackageProvider failed: $_" -Level DEBUG
+        return $null
+    }
+}
+
+function Install-ModuleSafe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$MinVersion,
+        [ValidateSet('Auto','PSResourceGet','PowerShellGet')][string]$Provider = 'Auto',
+        [switch]$Force
+    )
+
+    $selected = if ($Provider -eq 'Auto') { Get-PreferredPackageProvider() } else { $Provider }
+    if (-not $selected) { Write-ProfileLog "No package provider available to install $Name" -Level WARN; return $false }
+
+    try {
+        if ($selected -eq 'PSResourceGet') {
+            $params = @{ Name = $Name; Scope = 'CurrentUser'; TrustRepository = $true; ErrorAction = 'Stop'; Quiet = $true }
+            if ($MinVersion) { $params['Version'] = $MinVersion }
+            if ($Force) { $params['Reinstall'] = $true }
+            Install-PSResource @params | Out-Null
+            Write-ProfileLog "Installed $Name via PSResourceGet" -Level SUCCESS
+            return $true
+        }
+
+        # PowerShellGet fallback
+        $installParams = @{ Name = $Name; Scope = 'CurrentUser'; Force = $true; AllowClobber = $true; ErrorAction = 'Stop' }
+        if ($MinVersion) { $installParams['MinimumVersion'] = $MinVersion }
+        Install-Module @installParams | Out-Null
+        Write-ProfileLog "Installed $Name via PowerShellGet" -Level SUCCESS
+        return $true
+    } catch {
+        Write-ProfileLog "Install-ModuleSafe failed for $Name : $_" -Level ERROR
+        return $false
+    }
+}
+
+function Ensure-ModuleInstalled {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$MinVersion,
+        [ValidateSet('Auto','PSResourceGet','PowerShellGet')][string]$Provider = 'Auto'
+    )
+
+    $current = Get-InstalledModuleVersion -Name $Name
+    if ($current -and -not $MinVersion) { return $true }
+    if ($current -and $MinVersion) {
+        try {
+            if ((Compare-Version -Current $current -Required ([version]$MinVersion)) -ge 0) { return $true }
+        } catch {}
+    }
+
+    return Install-ModuleSafe -Name $Name -MinVersion $MinVersion -Provider $Provider -Force
+}
+
+function Ensure-OhMyPoshPath {
+    [CmdletBinding()]
+    param()
+    try {
+        $binary = Get-Command $Global:ProfileConfig.OhMyPosh.BinaryName -ErrorAction SilentlyContinue
+        if ($binary) { return $true }
+
+        $module = Get-Module -ListAvailable -Name $Global:ProfileConfig.OhMyPosh.ModuleName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $module) { return $false }
+
+        $binPath = Join-Path (Split-Path -Parent $module.Path) 'bin'
+        if (Test-Path -LiteralPath $binPath) {
+            if (Ensure-PathPrefix -Path $binPath) { Write-ProfileLog "Added oh-my-posh bin to PATH: $binPath" -Level DEBUG }
+            return $null -ne (Get-Command $Global:ProfileConfig.OhMyPosh.BinaryName -ErrorAction SilentlyContinue)
+        }
+        return $false
+    } catch {
+        Write-ProfileLog "Ensure-OhMyPoshPath failed: $_" -Level DEBUG
+        return $false
+    }
+}
+
+function Ensure-OhMyPoshThemesPath {
+    [CmdletBinding()]
+    param()
+    try {
+        if ($env:POSH_THEMES_PATH -and (Test-Path -LiteralPath $env:POSH_THEMES_PATH)) { return $true }
+
+        $module = Get-Module -ListAvailable -Name $Global:ProfileConfig.OhMyPosh.ModuleName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($module) {
+            $themes = Join-Path (Split-Path -Parent $module.Path) 'themes'
+            if (Test-Path -LiteralPath $themes) { $env:POSH_THEMES_PATH = $themes; return $true }
+        }
+
+        $fallback = Join-Path $HOME '.poshthemes'
+        if (Test-Path -LiteralPath $fallback) { $env:POSH_THEMES_PATH = $fallback; return $true }
+        return $false
+    } catch {
+        Write-ProfileLog "Ensure-OhMyPoshThemesPath failed: $_" -Level DEBUG
+        return $false
+    }
+}
+
+function Invoke-FirstRunProvisioning {
+    [CmdletBinding()]
+    param()
+
+    # Avoid repeated provisioning if state already recorded
+    if ($Global:ProfileState.Provisioned -and (Test-Path $script:ProvisionStateFile)) { return $true }
+
+    # Light network gate: refresh if unknown
+    if ($null -eq $Global:ProfileState.HasNetwork) { try { Test-Environment | Out-Null } catch {} }
+    if ($Global:ProfileState.HasNetwork -eq $false) {
+        Write-ProfileLog 'Skipping provisioning (no network detected)' -Level WARN
+        return $false
+    }
+
+    $provider = $Global:ProfileConfig.Provisioning.Provider
+    if ($provider -eq 'Auto') { $provider = Get-PreferredPackageProvider() }
+    if (-not $provider) {
+        Write-ProfileLog 'No package provider available; cannot provision modules automatically' -Level WARN
+        return $false
+    }
+
+    # Trust PSGallery for non-interactive install paths when possible
+    try {
+        $repo = Get-PSRepositorySafe -Name 'PSGallery'
+        if ($repo -and $repo.InstallationPolicy -ne 'Trusted' -and (Get-Command Set-PSRepository -ErrorAction SilentlyContinue)) {
+            Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+            Write-ProfileLog 'Set PSGallery InstallationPolicy to Trusted for provisioning' -Level DEBUG
+        }
+    } catch {}
+
+    $plan = Get-ProfileModulePlan | Where-Object { $_.Action -in @('Install','Update') }
+    foreach ($item in $plan) {
+        $null = Ensure-ModuleInstalled -Name $item.Name -MinVersion $item.RequiredVersion -Provider $provider
+    }
+
+    # Ensure oh-my-posh binary/themes path visibility post-install
+    Ensure-OhMyPoshPath | Out-Null
+    Ensure-OhMyPoshThemesPath | Out-Null
+
+    $state = [ordered]@{
+        Provisioned = $true
+        Timestamp = (Get-Date).ToString('o')
+        Provider = $provider
+        Modules = $plan
+    }
+    try {
+        $state | ConvertTo-Json -Depth 6 | Set-Content -Path $script:ProvisionStateFile -Force -Encoding UTF8
+        $Global:ProfileState.Provisioned = $true
+    } catch {
+        Write-ProfileLog "Failed to write provision state: $_" -Level WARN
+    }
+
+    return $Global:ProfileState.Provisioned
+}
+
+# Execute provisioning early (non-blocking best-effort)
+try { Invoke-FirstRunProvisioning | Out-Null } catch { Write-ProfileLog "First-run provisioning failed: $_" -Level DEBUG }
+
+#endregion
+
 #region 6 - Deferred Module Loader
 # Robust deferred loader with completion notification and optional spinner.
-$script:DeferredModules = @('Terminal-Icons','PSFzf')
-$script:ProvisionStateFile = Join-Path $Global:ProfileConfig.CachePath 'provision_state.json'
+$script:DeferredModules = @()
+$script:ProvisionStateFile = if ($script:ProvisionStateFile) { $script:ProvisionStateFile } else { Join-Path $Global:ProfileConfig.CachePath 'provision_state.json' }
 
 $Global:DeferredModulesStatus = [ordered]@{
     Started = $false
-    Completed = $false
+    Completed = ($script:DeferredModules.Count -eq 0)
     StartedAt = $null
     CompletedAt = $null
     Modules = @{}
@@ -897,6 +1090,45 @@ if (-not (Get-EventSubscriber -SourceIdentifier 'PowerShell.OnIdle' -ErrorAction
         try { Show-DeferredLoaderNotification } catch { Write-ProfileLog "Deferred loader notification failed: $_" -Level DEBUG }
     } -MessageData @{ Name = 'Profile.DeferredLoader' } -ErrorAction SilentlyContinue
 }
+
+# On-demand helpers to import optional modules without loading them at startup
+function Enable-TerminalIcons {
+    [CmdletBinding()]
+    param()
+    if (Get-Module -Name 'Terminal-Icons' -ErrorAction SilentlyContinue) { return $true }
+    $available = Get-Module -ListAvailable -Name 'Terminal-Icons' -ErrorAction SilentlyContinue
+    if (-not $available) {
+        Write-Host "Terminal-Icons is not installed. Run Invoke-FirstRunProvisioning or Install-Module Terminal-Icons." -ForegroundColor Yellow
+        return $false
+    }
+    try {
+        Import-Module -Name 'Terminal-Icons' -Global -ErrorAction Stop
+        Write-ProfileLog 'Terminal-Icons imported on-demand' -Level INFO
+        return $true
+    } catch {
+        Write-ProfileLog "Failed to import Terminal-Icons: $_" -Level WARN
+        return $false
+    }
+}
+
+function Enable-PSFzf {
+    [CmdletBinding()]
+    param()
+    if (Get-Module -Name 'PSFzf' -ErrorAction SilentlyContinue) { return $true }
+    $available = Get-Module -ListAvailable -Name 'PSFzf' -ErrorAction SilentlyContinue
+    if (-not $available) {
+        Write-Host "PSFzf is not installed. Run Invoke-FirstRunProvisioning or Install-Module PSFzf." -ForegroundColor Yellow
+        return $false
+    }
+    try {
+        Import-Module -Name 'PSFzf' -Global -ErrorAction Stop
+        Write-ProfileLog 'PSFzf imported on-demand' -Level INFO
+        return $true
+    } catch {
+        Write-ProfileLog "Failed to import PSFzf: $_" -Level WARN
+        return $false
+    }
+}
 #endregion
 
 #region 9 - PSReadLine Configuration
@@ -910,7 +1142,7 @@ if (-not ($Global:ProfileConfig.PSObject.Properties.Name -contains 'PSReadLine')
         HistorySize = $Global:ProfileConfig.HistorySize
         HistorySavePath = Join-Path $Global:ProfileConfig.CachePath 'PSReadLine_history.txt'
         MaximumKillRingCount = 10
-        PredictionSource = 'None'       # None, History, Plugin (depends on PSReadLine version)
+        PredictionSource = 'History'    # None, History, Plugin (depends on PSReadLine version)
         BellStyle = 'None'              # None, Audible, Visible
         Colors = @{
             Command = 'White'
@@ -939,6 +1171,17 @@ function Set-PSReadLineDefaults {
         return $false
     }
 
+    # Ensure the module is imported so options apply
+    try {
+        if (-not (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue)) {
+            Import-Module -Name PSReadLine -Global -ErrorAction Stop
+            Write-ProfileLog 'Imported PSReadLine prior to configuration' -Level DEBUG
+        }
+    } catch {
+        Write-ProfileLog "Failed to import PSReadLine: $_" -Level WARN
+        return $false
+    }
+
     try {
         # Basic options
         Set-PSReadLineOption -EditMode $Global:ProfileConfig.PSReadLine.EditMode
@@ -954,6 +1197,9 @@ function Set-PSReadLineDefaults {
                 Write-ProfileLog "PSReadLine prediction option not supported in this version" -Level DEBUG
             }
         }
+
+        # Preferred view style for predictions
+        try { Set-PSReadLineOption -PredictionViewStyle ListView -ErrorAction SilentlyContinue } catch {}
 
         # Colors applied as a hashtable if supported
         try {
